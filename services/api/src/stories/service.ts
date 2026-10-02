@@ -21,7 +21,7 @@ import {
   workspaces,
 } from "@facility/db";
 import { and, asc, desc, eq, inArray, isNull, lt, lte, notInArray, sql } from "drizzle-orm";
-import { CostBudgetService } from "../insights/costs.js";
+import { CostBudgetService, releaseOpenTurnReservation } from "../insights/costs.js";
 import { ACTIVITY_NOISE_TYPES, presentTurnEvent } from "../turns/activity.js";
 import { stopInterruptedEngineProcess } from "../turns/engines.js";
 import { appendTurnEvent } from "../turns/events.js";
@@ -575,6 +575,7 @@ export class StoryWorkspaceService {
           changed: false,
         };
       }
+      await releaseOpenTurnReservation(tx, input);
       const story = await scopedStory(tx, input.orgId, input.projectId, input.storyId);
       const remainingAttention = (
         await tx
@@ -676,6 +677,7 @@ export class StoryWorkspaceService {
           status: "failed",
           complete: false,
         });
+      await releaseOpenTurnReservation(tx, input);
       await tx
         .update(stories)
         .set({
