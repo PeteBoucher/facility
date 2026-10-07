@@ -434,6 +434,59 @@ describe("dead worker accounting", () => {
     expect(await costs.record(request)).toBeNull();
     expect((await costs.budgetState(orgId, input.projectId)).state).toBe("ok");
   });
+  it("keeps the project blocked until every interrupted turn is settled", async () => {
+    const input = await seed();
+    const secondId = newId("turn");
+    const original = (await db.select().from(turns).where(eq(turns.id, input.turnId)))[0];
+    if (!original) throw new Error("fixture turn missing");
+    await service.recoverInterruptedTurn(input);
+    await db.insert(turns).values({ ...original, id: secondId });
+    await service.recoverInterruptedTurn({ ...input, turnId: secondId });
+    const request = {
+      ...input,
+      agentName: "builder",
+      model: "gpt-5.5",
+      usage: counters,
+      durationMs: 10,
+      status: "failed" as const,
+    };
+    await costs.record(request);
+    await expect(costs.assertTurnAllowed(orgId, input.projectId, "gpt-5.5")).rejects.toMatchObject({
+      code: "budget_usage_unconfirmed",
+    });
+    await costs.record({ ...request, turnId: secondId });
+    expect((await costs.budgetState(orgId, input.projectId)).state).toBe("ok");
+    const rows = await db.select().from(turnUsage).where(eq(turnUsage.projectId, input.projectId));
+    expect(rows).toHaveLength(2);
+    expect(rows.every((row) => row.priced)).toBe(true);
+  });
+  it("settles competing final reports once without allowing a replay to change the charge", async () => {
+    const input = await seed();
+    await service.recoverInterruptedTurn(input);
+    const request = {
+      ...input,
+      agentName: "builder",
+      model: "gpt-5.5",
+      durationMs: 10,
+      status: "failed" as const,
+    };
+    const results = await Promise.all([
+      costs.record({ ...request, usage: { ...counters, reportedCostCents: 11 } }),
+      costs.record({ ...request, usage: { ...counters, reportedCostCents: 17 } }),
+    ]);
+    const written = results.filter((row) => row !== null);
+    expect(written).toHaveLength(1);
+    const before = await db.select().from(turnUsage).where(eq(turnUsage.turnId, input.turnId));
+    expect(before).toHaveLength(1);
+    expect([11, 17]).toContain(before[0]?.costCents);
+    expect((await costs.budgetState(orgId, input.projectId)).spentCents).toBe(before[0]?.costCents);
+    expect(
+      await costs.record({ ...request, usage: { ...counters, reportedCostCents: 0 } }),
+    ).toBeNull();
+    expect(await db.select().from(turnUsage).where(eq(turnUsage.turnId, input.turnId))).toEqual(
+      before,
+    );
+  });
   it("counts a previous-month worker's recovered charge when it is actually settled", async () => {
     const previous = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 0, 12));
     const input = await seed("codex", previous);
