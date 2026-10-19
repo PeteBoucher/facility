@@ -4,7 +4,7 @@
 # architecture-specific download/checksum matrix.
 FROM docker:29-dind-rootless@sha256:8a213afdd096a44dff403aaf8eb58b7a96a63113f18a4b094b98b7d0ed7d948b AS docker-tools
 
-# Rebuild the exact Go-based releases shipped by Docker with the first Go
+# Rebuild the reviewed Go-based releases with the first Go
 # toolchain that contains the reviewed standard-library fixes. The upstream
 # image still supplies its shell bootstrap and docker-init; every Go binary
 # that crosses into the runner is rebuilt from a checksum-pinned source commit.
@@ -33,6 +33,7 @@ RUN archive=/tmp/moby.tar.gz \
   && mkdir -p /src /out \
   && tar -xzf "$archive" --strip-components=1 -C /src \
   && cd /src \
+  && go mod edit -replace=github.com/containerd/containerd/v2=github.com/containerd/containerd/v2@v2.3.6 \
   && go mod edit -replace=golang.org/x/crypto=golang.org/x/crypto@v0.56.0 \
   && go mod edit -replace=golang.org/x/net=golang.org/x/net@v0.60.0 \
   && go mod edit -replace=golang.org/x/mod=golang.org/x/mod@v0.40.0 \
@@ -73,9 +74,9 @@ RUN archive=/tmp/docker-cli.tar.gz \
   && rm -rf /src "$archive" /root/.cache/go-build /go/pkg/mod /go/src/github.com/docker/cli
 
 FROM docker-cli-build AS containerd-build
-ARG CONTAINERD_VERSION=2.3.3
-ARG CONTAINERD_COMMIT=aad11006b869517fcd3009450b6f82da282e1a9b
-ARG CONTAINERD_SOURCE_SHA256=86793eec0b23ea8f7331ea61c5ef1e56ed6f8071de5ede9ce89b13310a1a072b
+ARG CONTAINERD_VERSION=2.3.6
+ARG CONTAINERD_COMMIT=ee2735368117d2eb259779949d5e75cdafec9761
+ARG CONTAINERD_SOURCE_SHA256=fa21eb211d0a9cb2ad32e6edb67808f7615252c8c56a63813ef1d0822bd2a90d
 RUN archive=/tmp/containerd.tar.gz \
   && curl --fail --silent --show-error --location --retry 3 \
     "https://github.com/containerd/containerd/archive/${CONTAINERD_COMMIT}.tar.gz" --output "$archive" \
@@ -123,6 +124,7 @@ RUN archive=/tmp/buildx.tar.gz \
   && tar -xzf "$archive" --strip-components=1 -C /src \
   && cd /src \
   && go mod edit -replace=github.com/moby/go-archive=github.com/moby/go-archive@v0.3.0 \
+  && go mod edit -replace=github.com/containerd/containerd/v2=github.com/containerd/containerd/v2@v2.3.6 \
   && go mod edit -replace=golang.org/x/crypto=golang.org/x/crypto@v0.56.0 \
   && go mod edit -replace=golang.org/x/net=golang.org/x/net@v0.60.0 \
   && go mod edit -replace=golang.org/x/mod=golang.org/x/mod@v0.40.0 \
@@ -146,6 +148,7 @@ RUN archive=/tmp/compose.tar.gz \
   && mkdir -p /src /out \
   && tar -xzf "$archive" --strip-components=1 -C /src \
   && cd /src \
+  && go mod edit -replace=github.com/containerd/containerd/v2=github.com/containerd/containerd/v2@v2.3.6 \
   && go mod edit -replace=golang.org/x/crypto=golang.org/x/crypto@v0.56.0 \
   && go mod edit -replace=golang.org/x/net=golang.org/x/net@v0.60.0 \
   && go mod edit -replace=golang.org/x/mod=golang.org/x/mod@v0.40.0 \
@@ -212,6 +215,12 @@ RUN for binary in /out/*; do \
     go version -m "$binary" | awk \
       '$1 == "=>" && $2 == "golang.org/x/net" && $3 == "v0.60.0" { found = 1 } END { exit !found }' || exit 1; \
   done \
+  && for binary in /out/dockerd /out/docker-buildx /out/docker-compose; do \
+    go version -m "$binary" | awk \
+      '$1 == "dep" { pending = ($2 == "github.com/containerd/containerd/v2"); if (pending) version = $3; next } \
+       pending && $1 == "=>" { if ($2 != "github.com/containerd/containerd/v2") { bad = 1; exit }; version = $3; pending = 0 } \
+       END { exit (bad || version != "v2.3.6") }' || exit 1; \
+  done \
   && for binary in /out/dockerd /out/containerd /out/rootlesskit /out/docker-buildx /out/docker-compose /out/gh; do \
     go version -m "$binary" | awk \
       '$1 == "=>" && $2 == "golang.org/x/crypto" && $3 == "v0.56.0" { found = 1 } END { exit !found }' || exit 1; \
@@ -238,8 +247,9 @@ FROM node:24-trixie-slim@sha256:50c3b2f6988dfc307b86e5301d69611af31f4789bdf23286
 # Bump this audited epoch only when a scanner identifies a distro fix that the
 # official image has not incorporated yet; using it in the command makes that
 # refresh explicit and reproducible instead of disabling the whole build cache.
-ARG DEBIAN_SECURITY_REFRESH=20261005
-ARG CHROMIUM_MIN_VERSION=154.0.8037.57-1~deb13u1
+ARG DEBIAN_SECURITY_REFRESH=20261019
+ARG CHROMIUM_MIN_VERSION=155.0.8059.79-1~deb13u1
+ARG EXPAT_MIN_VERSION=2.9.0-1~deb13u1
 RUN test -n "$DEBIAN_SECURITY_REFRESH" \
   && apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
@@ -294,6 +304,7 @@ RUN test -n "$DEBIAN_SECURITY_REFRESH" \
     xvfb \
   && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' chromium)" ge "$CHROMIUM_MIN_VERSION" \
   && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' chromium-common)" ge "$CHROMIUM_MIN_VERSION" \
+  && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libexpat1)" ge "$EXPAT_MIN_VERSION" \
   && rm -rf /var/lib/apt/lists/*
 
 # npm is a runtime capability for repositories that use package-lock.json, so
