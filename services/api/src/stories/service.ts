@@ -3,6 +3,7 @@ import { type AgentManifest, AgentManifestSchema } from "@facility/agents";
 import { newId } from "@facility/core";
 import {
   attentionItems,
+  budgetReservations,
   type FacilityDb,
   githubIssues,
   previewSessions,
@@ -779,11 +780,7 @@ export class StoryWorkspaceService {
   /** Retry accounting without waking compute or rerunning a provider call. */
   async reconcileInterruptedUsage(input: { orgId: string; projectId: string; turnId: string }) {
     const turn = await scopedTurn(this.db, input.orgId, input.projectId, input.turnId);
-    if (
-      turn.state !== "failed" ||
-      turn.error !== "Worker heartbeat expired before the agent turn completed."
-    )
-      return false;
+    if (!["succeeded", "failed", "canceled"].includes(turn.state)) return false;
     const settled = await this.db
       .select({ priced: turnUsage.priced })
       .from(turnUsage)
@@ -795,8 +792,27 @@ export class StoryWorkspaceService {
         ),
       )
       .limit(1);
-    if (settled[0]?.priced) return false;
+    if (settled[0]?.priced) {
+      await releaseOpenTurnReservation(this.db, input);
+      return false;
+    }
     if (!settled[0]) {
+      const hold = await this.db
+        .select({ id: budgetReservations.id })
+        .from(budgetReservations)
+        .where(
+          and(
+            eq(budgetReservations.orgId, input.orgId),
+            eq(budgetReservations.projectId, input.projectId),
+            eq(budgetReservations.turnId, turn.id),
+            eq(budgetReservations.state, "open"),
+          ),
+        )
+        .limit(1);
+      const legacyInterrupted =
+        turn.state === "failed" &&
+        turn.error === "Worker heartbeat expired before the agent turn completed.";
+      if (!hold[0] && !legacyInterrupted) return false;
       // Upgrade recovery: old workers marked failure without writing any usage row.
       const phases = await this.db
         .select({ data: turnEvents.data })
@@ -809,7 +825,18 @@ export class StoryWorkspaceService {
             eq(turnEvents.type, "turn.phase"),
           ),
         );
-      if (!providerMayHaveRun(phases)) return false;
+      if (!providerMayHaveRun(phases)) {
+        await new CostBudgetService(this.db).record({
+          ...input,
+          storyId: turn.storyId,
+          agentName: turn.agentName,
+          engine: turn.engine,
+          model: turn.model,
+          durationMs: 0,
+          status: "failed",
+        });
+        return false;
+      }
       await new CostBudgetService(this.db).record({
         ...input,
         storyId: turn.storyId,
@@ -865,7 +892,7 @@ export class StoryWorkspaceService {
       ...measured,
       durationMs:
         turn.startedAt && turn.endedAt ? turn.endedAt.getTime() - turn.startedAt.getTime() : 0,
-      status: "failed",
+      status: turn.state === "succeeded" ? "succeeded" : "failed",
     });
     return recorded?.priced === true;
   }

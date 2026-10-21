@@ -1,17 +1,19 @@
-import { costCents, newId, normalizeModel, reservationCents } from "@facility/core";
-import { budgetReservations, type FacilityDb, projectBudgets, turnUsage } from "@facility/db";
-import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
-import type { AgentTurnUsage } from "../turns/engines.js";
+import { BudgetPolicyError } from "./budget-policy.js";
+import { ModelCallLedger, type ModelCallReceipt, type ModelCallSettlement } from "./model-calls.js";
 
-export class BudgetPolicyError extends Error {
-  constructor(
-    readonly code: "budget_exceeded" | "budget_model_unpriced" | "budget_usage_unconfirmed",
-    message: string,
-  ) {
-    super(message);
-    this.name = "BudgetPolicyError";
-  }
-}
+export { BudgetPolicyError } from "./budget-policy.js";
+
+import { costCents, newId, normalizeModel, reservationCents } from "@facility/core";
+import {
+  budgetReservations,
+  type FacilityDb,
+  modelCalls,
+  projectBudgets,
+  turns,
+  turnUsage,
+} from "@facility/db";
+import { and, desc, eq, gte, inArray, lt, sql } from "drizzle-orm";
+import type { AgentTurnUsage } from "../turns/engines.js";
 
 export type BudgetState = {
   budget: typeof projectBudgets.$inferSelect | null;
@@ -24,7 +26,15 @@ export type BudgetState = {
 };
 
 export class CostBudgetService {
-  constructor(private readonly db: FacilityDb) {}
+  private readonly apiCalls: ModelCallLedger;
+  constructor(private readonly db: FacilityDb) {
+    this.apiCalls = new ModelCallLedger(db, {
+      lockBudget,
+      committedCents,
+      hasUnconfirmedUsage,
+      assertRoom,
+    });
+  }
 
   async assertTurnAllowed(orgId: string, projectId: string, model: string, now = new Date()) {
     const state = await this.budgetState(orgId, projectId, now);
@@ -32,7 +42,7 @@ export class CostBudgetService {
     if (state.state === "unconfirmed") {
       throw new BudgetPolicyError(
         "budget_usage_unconfirmed",
-        "Project spending is unconfirmed after an interrupted turn; new model calls are blocked while the budget is enabled.",
+        "Project spending is unconfirmed after an agent or API call; new model calls are blocked while the budget is enabled.",
       );
     }
     if (!normalizeModel(model)) {
@@ -95,141 +105,44 @@ export class CostBudgetService {
     return id;
   }
 
-  /** Hold the title estimate, or reuse the hold already taken for this story. */
-  async reserveTitle(
-    input: { orgId: string; projectId: string; storyId: string; model: string },
+  reserveTitle(
+    input: {
+      orgId: string;
+      projectId: string;
+      storyId: string;
+      model: string;
+      provider?: "openai" | "anthropic";
+      requestKey?: string;
+      fingerprint?: string;
+    },
     now = new Date(),
-  ): Promise<
-    | { outcome: "admitted"; reservationId: string | null }
-    | { outcome: "exceeded" }
-    | { outcome: "unpriced" }
-    | { outcome: "unconfirmed" }
-  > {
-    return this.db.transaction(async (rawTx) => {
-      const tx = rawTx as unknown as FacilityDb;
-      const budget = await lockBudget(tx, input.orgId, input.projectId);
-      if (budget?.enabled && (await hasUnconfirmedUsage(tx, input.orgId, input.projectId)))
-        return { outcome: "unconfirmed" as const };
-      const existing = (
-        await tx
-          .select()
-          .from(budgetReservations)
-          .where(
-            and(
-              eq(budgetReservations.orgId, input.orgId),
-              eq(budgetReservations.projectId, input.projectId),
-              eq(budgetReservations.storyId, input.storyId),
-              eq(budgetReservations.purpose, "title"),
-              eq(budgetReservations.state, "open"),
-            ),
-          )
-          .for("update")
-      )[0];
-      if (!budget?.enabled) {
-        if (existing)
-          await tx.delete(budgetReservations).where(eq(budgetReservations.id, existing.id));
-        return { outcome: "admitted" as const, reservationId: null };
-      }
-      const estimate = reservationCents(input.model, "title");
-      if (estimate === null) {
-        if (existing)
-          await tx.delete(budgetReservations).where(eq(budgetReservations.id, existing.id));
-        return { outcome: "unpriced" as const };
-      }
-      if (existing) return { outcome: "admitted" as const, reservationId: existing.id };
-      const committed = await committedCents(tx, input.orgId, input.projectId, now);
-      if (exceedsBudget(committed, estimate, budget.monthlyLimitCents)) {
-        return { outcome: "exceeded" as const };
-      }
-      if (estimate === 0) return { outcome: "admitted" as const, reservationId: null };
-      const id = newId("evt");
-      await tx.insert(budgetReservations).values({
-        id,
-        orgId: input.orgId,
-        projectId: input.projectId,
-        storyId: input.storyId,
-        turnId: null,
-        purpose: "title",
-        state: "open",
-        model: input.model,
-        reservedCents: estimate,
-      });
-      return { outcome: "admitted" as const, reservationId: id };
-    });
+  ) {
+    return this.apiCalls.reserveTitle(input, now);
   }
 
-  /** Replace a title hold with the measured cost. A missing hold still records a charge when a budget exists. */
-  async settleTitle(input: {
-    orgId: string;
-    projectId: string;
-    storyId: string;
-    model: string;
-    reservationId: string | null;
-    cents: number;
-  }) {
-    const cents = finiteNonNegative(input.cents) ?? 0;
-    await this.db.transaction(async (rawTx) => {
-      const tx = rawTx as unknown as FacilityDb;
-      const budget = await lockBudget(tx, input.orgId, input.projectId);
-      if (input.reservationId) {
-        if (!budget || cents === 0) {
-          await tx
-            .delete(budgetReservations)
-            .where(
-              and(
-                eq(budgetReservations.id, input.reservationId),
-                eq(budgetReservations.state, "open"),
-              ),
-            );
-          return;
-        }
-        const updated = await tx
-          .update(budgetReservations)
-          .set({ state: "settled", reservedCents: cents, model: input.model })
-          .where(
-            and(
-              eq(budgetReservations.id, input.reservationId),
-              eq(budgetReservations.state, "open"),
-            ),
-          )
-          .returning({ id: budgetReservations.id });
-        if (updated.length > 0) return;
-      }
-      if (!budget || cents === 0) return;
-      const prior = (
-        await tx
-          .select({ id: budgetReservations.id })
-          .from(budgetReservations)
-          .where(
-            and(
-              eq(budgetReservations.orgId, input.orgId),
-              eq(budgetReservations.storyId, input.storyId),
-              eq(budgetReservations.purpose, "title"),
-              eq(budgetReservations.state, "settled"),
-            ),
-          )
-          .limit(1)
-      )[0];
-      if (prior) return;
-      await tx.insert(budgetReservations).values({
-        id: newId("evt"),
-        orgId: input.orgId,
-        projectId: input.projectId,
-        storyId: input.storyId,
-        turnId: null,
-        purpose: "title",
-        state: "settled",
-        model: input.model,
-        reservedCents: cents,
-      });
-    });
+  claimModelCall(
+    input: { orgId: string; projectId: string; storyId: string; callId: string },
+    now = new Date(),
+  ) {
+    return this.apiCalls.claim(input, now);
   }
 
-  async releaseReservation(id: string | null) {
-    if (!id) return;
-    await this.db
-      .delete(budgetReservations)
-      .where(and(eq(budgetReservations.id, id), eq(budgetReservations.state, "open")));
+  settleTitle<T>(
+    input: ModelCallSettlement,
+    publish?: (tx: FacilityDb, receipt: ModelCallReceipt) => Promise<T>,
+  ) {
+    return this.apiCalls.settle(input, publish);
+  }
+
+  releaseReservation(
+    id: string | null,
+    scope: { orgId: string; projectId: string; storyId: string },
+  ) {
+    return this.apiCalls.release(id, scope);
+  }
+
+  recoverModelCalls(now = new Date()) {
+    return this.apiCalls.recover(now);
   }
 
   async record(input: {
@@ -432,10 +345,6 @@ export function reservationFits(committed: number, estimate: number, limit: numb
   return committed < limit && committed + estimate <= limit;
 }
 
-function exceedsBudget(committed: number, estimate: number, limit: number) {
-  return !reservationFits(committed, estimate, limit);
-}
-
 function exhaustedMessage(committed: number, limit: number) {
   return `Project monthly budget is exhausted (${committed.toFixed(2)} of ${limit} cents)`;
 }
@@ -453,6 +362,9 @@ function assertRoom(committed: number, estimate: number, limit: number, purpose:
 }
 
 async function lockBudget(db: FacilityDb, orgId: string, projectId: string) {
+  await db.execute(
+    sql`SELECT pg_advisory_xact_lock(hashtext(${`facility:budget:${orgId}:${projectId}`}))`,
+  );
   return (
     await db
       .select()
@@ -463,7 +375,7 @@ async function lockBudget(db: FacilityDb, orgId: string, projectId: string) {
   )[0];
 }
 
-/** Measured turn usage plus open holds and title charges settled this month. */
+/** Measured turn usage, open holds, legacy title receipts and API charges, each counted once. */
 export async function committedCents(
   db: FacilityDb,
   orgId: string,
@@ -494,10 +406,17 @@ export async function committedCents(
             ${budgetReservations.state} = 'open'
             or (
               ${budgetReservations.state} = 'settled'
+              and ${budgetReservations.modelCallId} is null
               and ${budgetReservations.createdAt} >= ${windowStart}
               and ${budgetReservations.createdAt} < ${windowEnd}
             )
           )
+      ), 0)
+      + coalesce((
+        select sum(${modelCalls.costCents}) from ${modelCalls}
+        where ${modelCalls.orgId} = ${orgId} and ${modelCalls.projectId} = ${projectId}
+          and ${modelCalls.state} in ('confirmed', 'unconfirmed')
+          and ${modelCalls.settledAt} >= ${windowStart} and ${modelCalls.settledAt} < ${windowEnd}
       ), 0)
     )::float8 as spent_cents
   `);
@@ -538,5 +457,53 @@ async function hasUnconfirmedUsage(db: FacilityDb, orgId: string, projectId: str
       ),
     )
     .limit(1);
-  return rows.length > 0;
+  if (rows.length > 0) return true;
+  const uncertainCalls = await db
+    .select({ id: modelCalls.id })
+    .from(modelCalls)
+    .where(
+      and(
+        eq(modelCalls.orgId, orgId),
+        eq(modelCalls.projectId, projectId),
+        sql`(${modelCalls.state} = 'unconfirmed' or (${modelCalls.state} = 'started' and ${modelCalls.expiresAt} <= now()))`,
+      ),
+    )
+    .limit(1);
+  if (uncertainCalls.length > 0) return true;
+  const legacyTitles = await db
+    .select({ id: budgetReservations.id })
+    .from(budgetReservations)
+    .where(
+      and(
+        eq(budgetReservations.orgId, orgId),
+        eq(budgetReservations.projectId, projectId),
+        eq(budgetReservations.purpose, "title"),
+        eq(budgetReservations.state, "open"),
+        sql`${budgetReservations.modelCallId} is null`,
+      ),
+    )
+    .limit(1);
+  if (legacyTitles.length > 0) return true;
+  const stranded = await db
+    .select({ id: budgetReservations.id })
+    .from(budgetReservations)
+    .innerJoin(
+      turns,
+      and(
+        eq(turns.id, budgetReservations.turnId),
+        eq(turns.orgId, budgetReservations.orgId),
+        eq(turns.projectId, budgetReservations.projectId),
+      ),
+    )
+    .where(
+      and(
+        eq(budgetReservations.orgId, orgId),
+        eq(budgetReservations.projectId, projectId),
+        eq(budgetReservations.state, "open"),
+        eq(budgetReservations.purpose, "turn"),
+        inArray(turns.state, ["succeeded", "failed", "canceled"]),
+      ),
+    )
+    .limit(1);
+  return stranded.length > 0;
 }

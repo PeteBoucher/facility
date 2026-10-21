@@ -31,6 +31,7 @@ import { TurnLeaseHeartbeat } from "./lease-heartbeat.js";
 import { LiveTurnEvents } from "./live-events.js";
 import { buildPrompt } from "./prompt.js";
 import { redactEvent as redact, redactString } from "./redaction.js";
+import { readUsageJournal } from "./usage-journal.js";
 
 export class TurnDispatcher {
   constructor(
@@ -72,6 +73,7 @@ export class TurnDispatcher {
     let startedGitEvidence: StartedGitEvidence | undefined;
     let gitEvidenceCompleted = false;
     let engineStarted = false;
+    let currentWorkspace: WorkspaceLocator | undefined;
     let liveEvents: LiveTurnEvents | undefined;
     let health: TurnHealthMonitor | undefined;
     try {
@@ -132,6 +134,7 @@ export class TurnDispatcher {
       ]);
       if (!workspace || !conversation)
         throw new Error("story workspace or conversation is missing");
+      currentWorkspace = workspaceLocator(workspace);
       const manifest = AgentManifestSchema.parse(turn.manifest);
       if (manifest.hash !== turn.manifestHash || manifest.name !== turn.agentName) {
         throw new Error("turn agent manifest snapshot does not match its recorded identity");
@@ -348,6 +351,7 @@ export class TurnDispatcher {
         engine: manifest.engine,
         model: manifest.model,
         usage: result.usage,
+        complete: result.usage !== undefined,
         durationMs: result.durationMs,
         status: "succeeded",
       });
@@ -430,6 +434,29 @@ export class TurnDispatcher {
         await this.evidence.complete(startedGitEvidence).catch(() => undefined);
         gitEvidenceCompleted = true;
       }
+      if (!reservationSettled) {
+        const retained =
+          engineStarted && this.runtime && currentWorkspace
+            ? await readUsageJournal(this.runtime, currentWorkspace, turn.id, turn.engine)
+            : undefined;
+        await this.costs.record({
+          ...input,
+          storyId: turn.storyId,
+          agentName: turn.agentName,
+          engine: turn.engine,
+          model: turn.model,
+          usage: retained?.complete
+            ? retained.usage
+            : ((error instanceof AgentEngineError ? asUsage(error.details.usage) : undefined) ??
+              retained?.usage),
+          complete: engineStarted ? retained?.complete === true : undefined,
+          durationMs: turn.startedAt ? Date.now() - turn.startedAt.getTime() : 0,
+          status: "failed",
+        });
+        // If accounting fails, retain the hold and let recovery reconcile it.
+        // Never admit a successor between releasing a hold and booking its bill.
+        reservationSettled = true;
+      }
       if (await this.isCanceled(input.orgId, input.projectId, input.turnId)) {
         await appendTurnEvent(this.db, {
           ...eventBase,
@@ -465,23 +492,6 @@ export class TurnDispatcher {
         return { claimed: true as const, state: "canceled" as const };
       }
       if (error instanceof AgentEngineError) {
-        await this.costs
-          .record({
-            orgId: input.orgId,
-            projectId: input.projectId,
-            storyId: turn.storyId,
-            turnId: turn.id,
-            agentName: turn.agentName,
-            engine: turn.engine,
-            model: turn.model,
-            usage: asUsage(error.details.usage),
-            durationMs: numberValue(error.details.durationMs) ?? 0,
-            status: "failed",
-          })
-          .then(() => {
-            reservationSettled = true;
-          })
-          .catch(() => undefined);
         if (!liveEvents) await this.persistFailedEngineEvents(error, eventBase, secrets);
       }
       const detail = redactString(error instanceof Error ? error.message : String(error), secrets);
@@ -499,9 +509,6 @@ export class TurnDispatcher {
       await this.activateQueuedSuccessor({ ...input, storyId: turn.storyId });
       return { claimed: true as const, state: "failed" as const, error: detail };
     } finally {
-      if (admission.reservationId && !reservationSettled) {
-        await this.costs.releaseReservation(admission.reservationId).catch(() => undefined);
-      }
       try {
         await health?.stop();
       } finally {

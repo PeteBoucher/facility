@@ -351,6 +351,8 @@ describe("cost controls, GitHub mirror, and backlog", async () => {
     const reserveProjectId = newId("proj");
     const reserveStoryId = newId("story");
     const reserveConversationId = newId("sess");
+    const otherReserveStoryId = newId("story");
+    const otherReserveConversationId = newId("sess");
     const turnA = newId("turn");
     const turnB = newId("turn");
     await db.insert(projects).values({
@@ -360,27 +362,50 @@ describe("cost controls, GitHub mirror, and backlog", async () => {
       slug: `reserve-${suffix}`,
       settings: {},
     });
-    await db.insert(stories).values({
-      id: reserveStoryId,
-      orgId,
-      projectId: reserveProjectId,
-      provider: "manual",
-      externalId: `reserve-${suffix}`,
-      title: "Reservation race",
-      createdBy: { type: "user", id: "maintainer" },
-    });
-    await db.insert(storyConversations).values({
-      id: reserveConversationId,
-      orgId,
-      projectId: reserveProjectId,
-      storyId: reserveStoryId,
-    });
-    await db
-      .insert(turns)
-      .values([
-        turnFixture(turnA, reserveProjectId, reserveStoryId, reserveConversationId),
-        turnFixture(turnB, reserveProjectId, reserveStoryId, reserveConversationId),
-      ]);
+    await db.insert(stories).values([
+      {
+        id: reserveStoryId,
+        orgId,
+        projectId: reserveProjectId,
+        provider: "manual",
+        externalId: `reserve-${suffix}`,
+        title: "Reservation race",
+        createdBy: { type: "user", id: "maintainer" },
+      },
+      {
+        id: otherReserveStoryId,
+        orgId,
+        projectId: reserveProjectId,
+        provider: "manual",
+        externalId: `other-reserve-${suffix}`,
+        title: "Concurrent reservation",
+        createdBy: { type: "user", id: "maintainer" },
+      },
+    ]);
+    await db.insert(storyConversations).values([
+      {
+        id: reserveConversationId,
+        orgId,
+        projectId: reserveProjectId,
+        storyId: reserveStoryId,
+      },
+      {
+        id: otherReserveConversationId,
+        orgId,
+        projectId: reserveProjectId,
+        storyId: otherReserveStoryId,
+      },
+    ]);
+    await db.insert(turns).values([
+      {
+        ...turnFixture(turnA, reserveProjectId, reserveStoryId, reserveConversationId),
+        state: "queued",
+      },
+      {
+        ...turnFixture(turnB, reserveProjectId, otherReserveStoryId, otherReserveConversationId),
+        state: "queued",
+      },
+    ]);
     await db.insert(projectBudgets).values({
       id: newId("bud"),
       orgId,
@@ -405,7 +430,7 @@ describe("cost controls, GitHub mirror, and backlog", async () => {
         costs.reserveTurn(tx as unknown as typeof db, {
           orgId,
           projectId: reserveProjectId,
-          storyId: reserveStoryId,
+          storyId: otherReserveStoryId,
           turnId: turnB,
           model: "claude-haiku-4-5",
         }),
@@ -432,11 +457,12 @@ describe("cost controls, GitHub mirror, and backlog", async () => {
     });
 
     const winnerId = held[0]?.turnId;
-    if (!winnerId) throw new Error("expected the admitted turn");
+    const winnerStoryId = held[0]?.storyId;
+    if (!winnerId || !winnerStoryId) throw new Error("expected the admitted turn");
     await costs.record({
       orgId,
       projectId: reserveProjectId,
-      storyId: reserveStoryId,
+      storyId: winnerStoryId,
       turnId: winnerId,
       agentName: "builder",
       engine: "claude_code",
@@ -456,11 +482,12 @@ describe("cost controls, GitHub mirror, and backlog", async () => {
     expect(measured).toBeLessThan(estimate);
 
     const loserId = winnerId === turnA ? turnB : turnA;
+    const loserStoryId = winnerId === turnA ? otherReserveStoryId : reserveStoryId;
     const second = await db.transaction(async (tx) =>
       costs.reserveTurn(tx as unknown as typeof db, {
         orgId,
         projectId: reserveProjectId,
-        storyId: reserveStoryId,
+        storyId: loserStoryId,
         turnId: loserId,
         model: "claude-haiku-4-5",
       }),
@@ -469,7 +496,7 @@ describe("cost controls, GitHub mirror, and backlog", async () => {
     await costs.record({
       orgId,
       projectId: reserveProjectId,
-      storyId: reserveStoryId,
+      storyId: loserStoryId,
       turnId: loserId,
       agentName: "builder",
       engine: "claude_code",

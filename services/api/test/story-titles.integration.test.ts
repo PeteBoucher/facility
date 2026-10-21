@@ -238,22 +238,32 @@ describe("story title generation", async () => {
   });
 
   it("settles a title reservation to the measured token cost", async () => {
-    const storyId = await seedStory({ engine: "codex" });
+    const measuredProjectId = newId("proj");
+    await db.insert(projects).values({
+      id: measuredProjectId,
+      orgId,
+      name: "Measured title",
+      slug: measuredProjectId,
+    });
+    const storyId = await seedStory({ engine: "codex", project: measuredProjectId });
     await db.insert(projectBudgets).values({
       id: newId("bud"),
       orgId,
-      projectId,
+      projectId: measuredProjectId,
       monthlyLimitCents: 1_000,
       warningPercent: 80,
       enabled: true,
     });
     await service({
       complete: async () => ({ title: "Measured title", inputTokens: 100, outputTokens: 10 }),
-    }).generate({ orgId, projectId, storyId });
+    }).generate({ orgId, projectId: measuredProjectId, storyId });
     const measured = costCents({ model: "gpt-5.5-mini", inputTokens: 100, outputTokens: 10 });
     expect(measured).not.toBeNull();
     const costs = new CostBudgetService(db);
-    expect((await costs.budgetState(orgId, projectId)).spentCents).toBeCloseTo(measured ?? 0, 6);
+    expect((await costs.budgetState(orgId, measuredProjectId)).spentCents).toBeCloseTo(
+      measured ?? 0,
+      6,
+    );
     expect(
       await db
         .select()
@@ -268,11 +278,41 @@ describe("story title generation", async () => {
     expect(settled[0]?.cents).toBeCloseTo(measured ?? 0, 6);
   });
 
+  it("retains uncertainty after a title provider reply is lost and does not repeat that paid attempt", async () => {
+    const isolatedProjectId = newId("proj");
+    await db
+      .insert(projects)
+      .values({ id: isolatedProjectId, orgId, name: "Uncertain title", slug: isolatedProjectId });
+    await db.insert(projectBudgets).values({
+      id: newId("bud"),
+      orgId,
+      projectId: isolatedProjectId,
+      monthlyLimitCents: 1000,
+      enabled: true,
+    });
+    const storyId = await seedStory({ project: isolatedProjectId });
+    const complete = vi.fn(async () => {
+      throw new Error("provider response lost");
+    });
+    const generator = service({ complete });
+    await generator.generate({ orgId, projectId: isolatedProjectId, storyId });
+    expect((await new CostBudgetService(db).budgetState(orgId, isolatedProjectId)).state).toBe(
+      "unconfirmed",
+    );
+    await generator.generate({ orgId, projectId: isolatedProjectId, storyId });
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
   it("retries transient provider failures and gives up after the attempt limit", async () => {
     const storyId = await seedStory();
     const flaky = service({
       complete: async () => {
-        throw new TitleProviderError("provider_unavailable", "anthropic responded with 503", true);
+        throw new TitleProviderError(
+          "provider_unavailable",
+          "Deterministic failure before provider submission",
+          true,
+          { certainty: "unbilled" },
+        );
       },
     });
     expect(await flaky.generate({ orgId, projectId, storyId })).toEqual({
@@ -300,7 +340,9 @@ describe("story title generation", async () => {
     expect(
       await service({
         complete: async () => {
-          throw new TitleProviderError("provider_rejected", "anthropic responded with 401", false);
+          throw new TitleProviderError("provider_rejected", "anthropic responded with 401", false, {
+            certainty: "unbilled",
+          });
         },
       }).generate({ orgId, projectId, storyId: rejected }),
     ).toEqual({ outcome: "fallback", reason: "provider_rejected" });
