@@ -63,7 +63,7 @@ exploitable through a Facility route, or replace application authorization and
 egress policy.
 
 The API, web, and runner images build from a digest-pinned `node:24-trixie-slim`
-base on Node.js 24.22.1, which contains the October 2026 Node.js security release.
+base on Node.js 24.22.1 or later, which contains the October 2026 Node.js security release.
 Running containers keep their previous Node.js runtime until the images are rebuilt
 and redeployed.
 

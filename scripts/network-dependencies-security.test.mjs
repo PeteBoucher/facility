@@ -154,19 +154,20 @@ function throwawayCertificate() {
 async function tlsPeer(t, identityCheck) {
   const { key, cert } = throwawayCertificate();
   let served = 0;
+  let agent;
   const server = createServer({ key, cert }, (_request, response) => {
     served += 1;
     response.end("fixture");
   });
-  server.listen(0, "127.0.0.1");
-  await once(server, "listening");
-  // Vulnerable Agents JSON-cloned `tls`: `ca` survived, the callback did not.
-  const agent = new Agent({ tls: { ca: cert, checkServerIdentity: identityCheck } });
   t.after(async () => {
-    await agent.destroy();
+    await agent?.destroy();
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
   });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  // Vulnerable Agents JSON-cloned `tls`: `ca` survived, the callback did not.
+  agent = new Agent({ tls: { ca: cert, checkServerIdentity: identityCheck } });
   const url = `https://127.0.0.1:${server.address().port}/`;
   return {
     served: () => served,
@@ -187,7 +188,7 @@ test("every locked undici line is at or above its reviewed security release", ()
   }
 });
 
-test("undici Agent runs a TLS identity callback that accepts the peer", async (t) => {
+test("undici Agent runs a TLS identity callback that accepts the peer", { timeout: 5000 }, async (t) => {
   let checks = 0;
   const peer = await tlsPeer(t, (host, certificate) => {
     checks += 1;
@@ -197,7 +198,7 @@ test("undici Agent runs a TLS identity callback that accepts the peer", async (t
   assert.equal(checks, 1);
 });
 
-test("undici Agent refuses a peer its TLS identity callback rejects", async (t) => {
+test("undici Agent refuses a peer its TLS identity callback rejects", { timeout: 5000 }, async (t) => {
   const peer = await tlsPeer(t, () => new Error("fixture pin mismatch"));
   await assert.rejects(peer.get(), /fixture pin mismatch/);
   assert.equal(peer.served(), 0);
